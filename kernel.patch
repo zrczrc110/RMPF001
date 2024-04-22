@@ -1,0 +1,939 @@
+diff --git a/include/linux/frontswap.h b/include/linux/frontswap.h
+index a631bac..ed1a73b 100644
+--- a/include/linux/frontswap.h
++++ b/include/linux/frontswap.h
+@@ -11,6 +11,8 @@ struct frontswap_ops {
+ 	void (*init)(unsigned); /* this swap type was just swapon'ed */
+ 	int (*store)(unsigned, pgoff_t, struct page *); /* store a page */
+ 	int (*load)(unsigned, pgoff_t, struct page *); /* load a page */
++	int (*load_async)(unsigned, pgoff_t, struct page *); /* load a page */
++	int (*poll_load)(int);
+ 	void (*invalidate_page)(unsigned, pgoff_t); /* page no longer needed */
+ 	void (*invalidate_area)(unsigned); /* swap type just swapoff'ed */
+ };
+@@ -20,6 +22,8 @@ int frontswap_register_ops(const struct frontswap_ops *ops);
+ extern void frontswap_init(unsigned type, unsigned long *map);
+ extern int __frontswap_store(struct page *page);
+ extern int __frontswap_load(struct page *page);
++extern int __frontswap_load_async(struct page *page);
++extern int __frontswap_poll_load(int cpu);
+ extern void __frontswap_invalidate_page(unsigned, pgoff_t);
+ extern void __frontswap_invalidate_area(unsigned);
+ 
+@@ -76,6 +80,22 @@ static inline int frontswap_load(struct page *page)
+ 	return -1;
+ }
+ 
++static inline int frontswap_load_async(struct page *page)
++{
++	if (frontswap_enabled())
++		return __frontswap_load_async(page);
++
++	return -1;
++}
++
++static inline int frontswap_poll_load(int cpu) 
++{
++	if (frontswap_enabled())
++		return __frontswap_poll_load(cpu);
++
++	return -1;
++}
++
+ static inline void frontswap_invalidate_page(unsigned type, pgoff_t offset)
+ {
+ 	if (frontswap_enabled())
+diff --git a/mm/frontswap.c b/mm/frontswap.c
+index 279e55b..8d85f6a 100644
+--- a/mm/frontswap.c
++++ b/mm/frontswap.c
+@@ -103,6 +103,7 @@ int frontswap_register_ops(const struct frontswap_ops *ops)
+ 	static_branch_inc(&frontswap_enabled_key);
+ 	return 0;
+ }
++EXPORT_SYMBOL(frontswap_register_ops);
+ 
+ /*
+  * Called when a swap device is swapon'd.
+@@ -221,6 +222,40 @@ int __frontswap_load(struct page *page)
+ 	return ret;
+ }
+ 
++int __frontswap_load_async(struct page *page)
++{
++	int ret = -1;
++	swp_entry_t entry = { .val = page_private(page), };
++	int type = swp_type(entry);
++	struct swap_info_struct *sis = swap_info[type];
++	pgoff_t offset = swp_offset(entry);
++
++	VM_BUG_ON(!frontswap_ops);
++	VM_BUG_ON(!PageLocked(page));
++	VM_BUG_ON(sis == NULL);
++
++	if (!__frontswap_test(sis, offset))
++		return -1;
++
++	/* Try loading from each implementation, until one succeeds. */
++	ret = frontswap_ops->load_async(type, offset, page);
++	if (ret == 0)
++		inc_frontswap_loads();
++	return ret;
++}
++
++int __frontswap_poll_load(int cpu)
++{
++	VM_BUG_ON(!frontswap_ops);
++
++	/* Try loading from each implementation, until one succeeds. */
++	return frontswap_ops->poll_load(cpu);
++
++	BUG();
++	return -1;
++}
++EXPORT_SYMBOL(__frontswap_poll_load);
++
+ /*
+  * Invalidate any data from frontswap associated with the specified swaptype
+  * and offset so that a subsequent "get" will fail.
+diff --git a/mm/page_io.c b/mm/page_io.c
+index 2af34dd..b68807a 100644
+--- a/mm/page_io.c
++++ b/mm/page_io.c
+@@ -470,7 +470,7 @@ int swap_readpage(struct page *page, bool synchronous,
+ 	}
+ 	delayacct_swapin_start();
+ 
+-	if (frontswap_load(page) == 0) {
++	if (frontswap_load_async(page) == 0) {
+ 		SetPageUptodate(page);
+ 		unlock_page(page);
+ 		goto out;
+@@ -524,6 +524,17 @@ int swap_readpage(struct page *page, bool synchronous,
+ 	return ret;
+ }
+ 
++int swap_readpage_sync(struct page *page, bool synchronous,
++		  struct swap_iocb **plug)
++{
++	VM_BUG_ON_PAGE(!PageSwapCache(page) && !synchronous, page);
++	VM_BUG_ON_PAGE(!PageLocked(page), page);
++	VM_BUG_ON_PAGE(PageUptodate(page), page);
++	
++	BUG_ON(frontswap_load(page));
++	return 0;
++}
++
+ void __swap_read_unplug(struct swap_iocb *sio)
+ {
+ 	struct iov_iter from;
+diff --git a/mm/swap.h b/mm/swap.h
+index cc08c45..f0649ef 100644
+--- a/mm/swap.h
++++ b/mm/swap.h
+@@ -4,12 +4,56 @@
+ 
+ #ifdef CONFIG_SWAP
+ #include <linux/blk_types.h> /* for bio_end_io_t */
++#include <linux/swap.h>
++
++struct swap_entry_lru {
++	int32_t loc;
++	int64_t delta;
++	uint64_t freq;
++}; 
++
++struct swap_entry {
++	int64_t delta;
++	int32_t pre;
++};
++
++struct swap_history {
++	pid_t pid;
++
++	uint16_t sz;
++	uint16_t max_sz;
++	uint32_t head;
++	unsigned long last_addr;
++
++	/*unsigned long fetch_1;
++	unsigned long fetch_2;
++	unsigned long fetch_4;
++	unsigned long fetch_8;*/
++	int16_t trace_idx;
++	int16_t trace_head;
++
++	uint64_t trend_found_leap[4];
++	uint64_t trend_found_ghb[4];
++
++	uint64_t swapin_readahead_hits;
++	uint64_t swapin_readahead_hits_total;
++	uint64_t swapin_readahead_entry;
++
++	uint64_t last_readahead_pages;
++
++	unsigned long *addr_trace;
++	struct swap_entry_lru *past_lru;
++	struct swap_entry *past_entry;
++	struct hlist_node node;
++};
+ 
+ /* linux/mm/page_io.c */
+ int sio_pool_init(void);
+ struct swap_iocb;
+ int swap_readpage(struct page *page, bool do_poll,
+ 		  struct swap_iocb **plug);
++int swap_readpage_sync(struct page *page, bool do_poll,
++		  struct swap_iocb **plug);
+ void __swap_read_unplug(struct swap_iocb *plug);
+ static inline void swap_read_unplug(struct swap_iocb *plug)
+ {
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 438d067..c7eb824 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -7,6 +7,7 @@
+  *
+  *  Rewritten to use page cache, (C) 1998 Stephen Tweedie
+  */
++#include "linux/mm_types.h"
+ #include <linux/mm.h>
+ #include <linux/gfp.h>
+ #include <linux/kernel_stat.h>
+@@ -22,6 +23,8 @@
+ #include <linux/swap_slots.h>
+ #include <linux/huge_mm.h>
+ #include <linux/shmem_fs.h>
++#include <linux/hashtable.h>
++#include <linux/frontswap.h>
+ #include "internal.h"
+ #include "swap.h"
+ 
+@@ -40,6 +43,16 @@ static const struct address_space_operations swap_aops = {
+ struct address_space *swapper_spaces[MAX_SWAPFILES] __read_mostly;
+ static unsigned int nr_swapper_spaces[MAX_SWAPFILES] __read_mostly;
+ static bool enable_vma_readahead __read_mostly = true;
++static bool _enable_prefetch __read_mostly = false;
++static bool _enable_trace_fetch __read_mostly = false;
++static unsigned prefetch_option __read_mostly = 0;
++static unsigned max_window_lru __read_mostly = 16;
++static unsigned max_window __read_mostly = 8192 << 1;
++static int end_dis __read_mostly = 2;
++static unsigned long long nr_trace_fetch = 0;
++static unsigned nr_swaps = 0;
++static unsigned long long _total_swap_pages = 0, _total_swap_hits = 0;
++//static unsigned long long fetch_pages_1 = 0, fetch_pages_2 = 0, fetch_pages_4 = 0, fetch_pages_8 = 0;
+ 
+ #define SWAP_RA_WIN_SHIFT	(PAGE_SHIFT / 2)
+ #define SWAP_RA_HITS_MASK	((1UL << SWAP_RA_WIN_SHIFT) - 1)
+@@ -59,8 +72,294 @@ static bool enable_vma_readahead __read_mostly = true;
+ #define GET_SWAP_RA_VAL(vma)					\
+ 	(atomic_long_read(&(vma)->swap_readahead_info) ? : 4)
+ 
++
+ static atomic_t swapin_readahead_hits = ATOMIC_INIT(4);
+ 
++static struct kmem_cache *swap_history_pool;
++DEFINE_HASHTABLE(swap_history_table, 10);
++
++bool fm_prefetch_leap(swp_entry_t entry, gfp_t gfp_mask, unsigned long mask, struct vm_area_struct *vma, unsigned long addr, struct swap_history* _swap_history);
++bool fm_prefetch_ghb(swp_entry_t entry, gfp_t gfp_mask, unsigned long mask, struct vm_area_struct *vma, unsigned long addr, struct swap_history* _swap_history);
++
++swp_entry_t get_swp_offset(unsigned long addr, struct swap_history* history) {
++	struct task_struct *task;
++    struct mm_struct *mm;
++	swp_entry_t entry = swp_entry(0, 0);
++    pgd_t *pgd;
++    p4d_t *p4d;
++    pud_t *pud;
++    pmd_t *pmd;
++    pte_t *ptep;
++
++    task = pid_task(find_vpid(history->pid), PIDTYPE_PID);
++
++    if (!task) {
++        //printk(KERN_ERR "Process with pid %d not found\n", history->pid);
++		goto skip;
++    }
++
++    mm = task->mm;
++	if(!mm)
++		goto skip;
++
++    pgd = pgd_offset(mm, addr);
++    if(pgd && (pgd_none(*pgd) || pgd_bad(*pgd))) goto skip;
++    
++    p4d = p4d_offset(pgd, addr);
++    if(p4d && (p4d_none(*p4d) || p4d_bad(*p4d))) goto skip;
++
++    pud = pud_offset(p4d, addr);
++    if(pud && (pud_none(*pud) || pud_bad(*pud))) goto skip;
++
++    pmd = pmd_offset(pud, addr);
++    if(pmd && (pmd_none(*pmd) || pmd_bad(*pmd))) goto skip;
++
++    ptep = pte_offset_map(pmd, addr);
++    if(!ptep) goto skip;
++
++    if(!pte_none(*ptep) && !pte_present(*ptep))
++		entry = pte_to_swp_entry(*ptep);
++
++    pte_unmap(ptep);
++
++skip:
++    return entry;
++}
++
++void insert_swap_history_table(struct swap_history *new_node) {
++    hash_add_rcu(swap_history_table, &new_node->node, new_node->pid);
++}
++
++struct swap_history *lookup_in_swap_history_table(pid_t pid) {
++    struct swap_history *value;
++	rcu_read_lock();
++    hash_for_each_possible_rcu(swap_history_table, value, node, pid) {
++        if(value->pid == pid) {
++            return value;
++		}
++    }
++	rcu_read_unlock();
++    return NULL;
++}
++
++void set_prefetch_max_window(unsigned max_sz) { max_window = max_sz; }
++EXPORT_SYMBOL(set_prefetch_max_window);
++
++void enable_prefetch(bool enabled) { 
++	_enable_prefetch = enabled; 
++	if(_enable_prefetch) {
++		if(!swap_history_pool) {
++			swap_history_pool = kmem_cache_create("swap_history_pool", sizeof(struct swap_history), 0, 0, NULL);
++			if(!swap_history_pool) {
++				_enable_prefetch = false;
++				pr_err("lacking memory to create kmem_cache for swap_history");
++			}
++		}
++	}
++	else {
++		int u;
++		struct hlist_node *htmp;
++		struct swap_history *history;
++		hash_for_each_safe(swap_history_table, u, htmp, history, node) {
++			hash_del_rcu(&history->node);
++			synchronize_rcu();
++			kfree(history->past_lru);
++			kfree(history->past_entry);
++			kmem_cache_free(swap_history_pool, history);
++		}
++	}
++}
++EXPORT_SYMBOL(enable_prefetch);
++
++void enable_trace_fetch(bool enabled) { _enable_trace_fetch = enabled; }
++EXPORT_SYMBOL(enable_trace_fetch);
++
++void set_prefetch_option(unsigned option) { prefetch_option = option; }
++EXPORT_SYMBOL(set_prefetch_option);
++/* trend_detection begin */
++
++int get_prev_idx(int idx, struct swap_history* history) { return idx ? idx - 1 : history->max_sz - 1;}
++
++void inc_head(struct swap_history* history) { 
++	int curr_head = history->head;
++	int max_sz = history->max_sz;
++	history->head = curr_head + 1 < max_sz ? curr_head + 1 : 0;
++}
++
++int match_or_evict(long delta, int loc, struct swap_history* history) {
++	int evict_candidate = 0, min_freq = history->past_lru[0].freq;
++	for(int u = 0; u < max_window_lru; u++)
++		if(history->past_lru[u].delta == delta) {
++			if(likely(history->past_entry[history->past_lru[u].loc].delta == delta) && loc != history->past_lru[u].loc)
++				history->past_lru[u].freq++;
++			else {
++				history->past_lru[u].freq = 1;
++				history->past_lru[u].loc = -1;
++			}
++			return u;
++		}
++		else {
++			if(history->past_lru[u].freq < min_freq) {
++				evict_candidate = u;
++				min_freq = history->past_lru[u].freq;
++			}
++		}
++	
++	history->past_lru[evict_candidate].delta 	= delta;
++	history->past_lru[evict_candidate].freq 	= 1;
++	history->past_lru[evict_candidate].loc	 	= -1;
++
++	return evict_candidate;
++}
++
++void set_prev(long delta, struct swap_history* history) {
++	int head = history->head, prev;
++	int target_idx = match_or_evict(delta, head, history);
++
++	prev = history->past_entry[head].pre = history->past_lru[target_idx].loc;
++	history->past_lru[target_idx].loc 	= head;
++
++	if(prev == -1 || history->past_entry[prev].delta != history->past_entry[head].delta) {
++		history->past_entry[head].pre = -1;
++		return;
++	}
++
++	for(int curr = prev; curr != -1; curr = history->past_entry[curr].pre) {
++		int pre = history->past_entry[curr].pre;
++		if(pre == -1) break;
++
++		if(pre == head || pre == prev || history->past_entry[pre].delta != history->past_entry[head].delta) {
++			history->past_entry[curr].pre = -1;
++			break;
++		}
++	}
++}
++
++void log_swap_trend(unsigned long addr, struct vm_area_struct *vma, struct swap_history* history) {
++	struct swap_entry _swap_entry;
++
++	if(history->sz) 
++		_swap_entry.delta = addr - history->last_addr;
++	else 
++		_swap_entry.delta = 0;
++
++	history->last_addr = addr;
++	history->past_entry[history->head] = _swap_entry;
++	set_prev(_swap_entry.delta, history);
++	//pr_info("addr:%lu loc:%u delta:%lld pre:%d", addr, history->head, history->past_entry[history->head].delta, history->past_entry[history->head].pre);
++	history->sz = history->sz + 1 < history->max_sz ? history->sz + 1 : history->max_sz;
++	inc_head(history);
++}
++
++bool _find_trend_ghb(int size, struct swap_history* history) {
++	int head = get_prev_idx(history->head, history), parent = get_prev_idx(head, history), idx_parent;
++	for(int idx = get_prev_idx(parent, history), cnt = 3; cnt < size; cnt++, idx = idx_parent) {
++		idx_parent = get_prev_idx(idx, history);
++		if(history->past_entry[idx].delta == history->past_entry[head].delta && 
++			history->past_entry[idx_parent].delta == history->past_entry[parent].delta) 
++				return true;
++	}
++
++	return false;
++}
++
++bool _find_trend_leap(int size, int *stride, struct swap_history* history) {
++	int cnt = 1, head, cur, i, j;
++	head = cur = get_prev_idx(history->head, history);
++
++	for(i = cur, j = 1; j < size; i = get_prev_idx(i, history), j++) {
++		if(history->past_entry[i].delta == history->past_entry[cur].delta)
++			cnt++;
++		else
++		 	cnt--;
++		
++		if(!cnt) {
++			cur = i;
++			cnt = 1;
++		}
++	}
++
++	cnt = 0;
++	for(i = head, j = 1; j < size; i = get_prev_idx(i, history), j++)
++		if(history->past_entry[i].delta == history->past_entry[cur].delta)
++			cnt++;
++
++	*stride = cnt > (size >> 1) ? history->past_entry[cur].delta : history->past_entry[head].delta;
++
++	return cnt > (size >> 1) && (*stride != 0);
++}
++
++bool find_trend_leap(int *stride, struct swap_history* history) {
++	bool has_trend = false;
++	int max_sz = history->sz;
++	for(int sz = 4; sz <= max_sz && !has_trend; sz <<= 1)
++		has_trend = _find_trend_leap(sz, stride, history);
++	return has_trend;
++}
++
++void detect_trend(int addr, struct swap_history* history) {
++	int max_sz = history->sz, placeholder;
++	for(uint8_t u = 2; (1 << u) <= max_sz && u < 6; u++) {
++		history->trend_found_leap[u - 2] += _find_trend_leap(1 << u, &placeholder, history);
++		history->trend_found_ghb[u - 2] += _find_trend_ghb(1 << u, history);
++	}
++}
++
++bool create_init_swap_history(pid_t pid) {
++	struct swap_history *_swap_history = kmem_cache_alloc(swap_history_pool, GFP_KERNEL);
++
++	if(_swap_history) {
++		_swap_history->pid = pid;
++		_swap_history->last_addr = 0;
++		_swap_history->head = 0;
++		_swap_history->sz = 0;
++		_swap_history->max_sz = max_window;
++
++		_swap_history->swapin_readahead_hits = 0;
++		_swap_history->swapin_readahead_hits_total = 0;
++		_swap_history->last_readahead_pages = 0;
++		_swap_history->swapin_readahead_entry = 0;
++
++		_swap_history->trace_head = 0;
++		_swap_history->trace_idx = 0;
++		/*_swap_history->fetch_1 = 0;
++		_swap_history->fetch_2 = 0;
++		_swap_history->fetch_4 = 0;
++		_swap_history->fetch_8 = 0;*/
++		for(uint8_t u = 0; u < 4; u++)
++			_swap_history->trend_found_leap[u] = _swap_history->trend_found_ghb[u] = 0;
++
++		_swap_history->addr_trace = kzalloc(max_window_lru * sizeof(unsigned long), GFP_KERNEL);
++		if(!_swap_history->addr_trace) 
++			goto no_addr_trace;
++		_swap_history->past_lru = kzalloc(max_window_lru * sizeof(struct swap_entry_lru), GFP_KERNEL);
++		if(!_swap_history->past_lru) 
++			goto no_lru;
++		_swap_history->past_entry = kzalloc(max_window * sizeof(struct swap_entry), GFP_KERNEL);
++		if(!_swap_history->past_entry) 
++			goto no_entry;
++		for(int u = 0; u < max_window; u++)
++			_swap_history->past_entry[u].pre = -1;
++
++		insert_swap_history_table(_swap_history);
++		nr_swaps++;
++		goto normal;
++	}
++
++	if(_swap_history) {
++no_entry:
++		kfree(_swap_history->past_lru);
++no_lru:
++		kfree(_swap_history->addr_trace);
++no_addr_trace:
++		kmem_cache_free(swap_history_pool, _swap_history);
++		_swap_history = NULL;
++	}
++
++normal:
++	return _swap_history != NULL;
++}
++
+ void show_swap_cache_info(void)
+ {
+ 	printk("%lu pages in swap cache\n", total_swapcache_pages());
+@@ -69,6 +368,31 @@ void show_swap_cache_info(void)
+ 	printk("Total swap = %lukB\n", total_swap_pages << (PAGE_SHIFT - 10));
+ }
+ 
++void swap_info_log(void) {
++	int u;
++	struct hlist_node *htmp;
++	struct swap_history *history;
++	hash_for_each_safe(swap_history_table, u, htmp, history, node) {
++		_total_swap_pages += history->swapin_readahead_entry;
++		_total_swap_hits += history->swapin_readahead_hits_total;
++		/*fetch_pages_1 += history->fetch_1;
++		fetch_pages_2 += history->fetch_2;
++		fetch_pages_4 += history->fetch_4;
++		fetch_pages_8 += history->fetch_8;*/
++		history->swapin_readahead_hits_total = 0;
++		history->swapin_readahead_entry = 0;
++		/*history->fetch_1 = 0;
++		history->fetch_2 = 0;
++		history->fetch_4 = 0;
++		history->fetch_8 = 0;*/
++	}
++	pr_info("nr_swaps: %d swap hits/times : %llu/%llu nr_trace_fetch %llu", 
++		nr_swaps, _total_swap_hits, _total_swap_pages, nr_trace_fetch);
++	_total_swap_pages = _total_swap_hits = nr_swaps = nr_trace_fetch = 0;
++	show_swap_cache_info();
++}
++EXPORT_SYMBOL(swap_info_log);
++
+ void *get_shadow_from_swap_cache(swp_entry_t entry)
+ {
+ 	struct address_space *address_space = swap_address_space(entry);
+@@ -337,10 +661,58 @@ struct folio *swap_cache_get_folio(swp_entry_t entry,
+ 	folio = filemap_get_folio(swap_address_space(entry), swp_offset(entry));
+ 	put_swap_device(si);
+ 
++	if(_enable_prefetch) {
++		struct swap_history *obj = lookup_in_swap_history_table(current->pid);
++		if(!obj) {
++			if(_enable_prefetch && create_init_swap_history(current->pid)) 
++				obj = lookup_in_swap_history_table(current->pid);
++		}
++		
++		if(likely(obj)) {
++			log_swap_trend(addr >> PAGE_SHIFT, vma, obj);
++			if(prefetch_option == 0) 
++				detect_trend(addr >> PAGE_SHIFT, obj);
++
++			rcu_read_unlock();
++		}
++	}
++
+ 	if (folio) {
+ 		bool vma_ra = swap_use_vma_readahead();
+ 		bool readahead;
+ 
++		if(_enable_prefetch) {
++			struct swap_history *obj = lookup_in_swap_history_table(current->pid);
++			if(obj) {
++				obj->swapin_readahead_hits++;
++				if(_enable_trace_fetch && obj->trace_head != -1) {
++					if(obj->addr_trace[obj->trace_idx] == addr) {
++						obj->trace_idx++;
++						if(obj->trace_head - obj->trace_idx < end_dis) {
++							swp_entry_t entry = get_swp_offset(addr, obj);
++							obj->trace_head = obj->trace_idx = 0;
++							switch (prefetch_option) {
++								case 1: 
++									fm_prefetch_leap(entry, GFP_HIGHUSER_MOVABLE, 8, vma, addr, obj);
++									break;
++								case 2:
++									fm_prefetch_ghb(entry, GFP_HIGHUSER_MOVABLE, 8, vma, addr, obj);
++									break;
++								default:
++									break;
++							}
++							nr_trace_fetch++;
++						}
++					}
++					else 
++						obj->trace_head = -1;
++				}
++				rcu_read_unlock();
++			}
++		}
++		else 
++			_total_swap_hits++;
++
+ 		/*
+ 		 * At the moment, we don't support PG_readahead for anon THP
+ 		 * so let's bail out rather than confusing the readahead stat.
+@@ -528,6 +900,21 @@ struct page *read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 	return retpage;
+ }
+ 
++struct page *read_swap_cache_sync(swp_entry_t entry, gfp_t gfp_mask,
++				   struct vm_area_struct *vma,
++				   unsigned long addr, bool do_poll,
++				   struct swap_iocb **plug)
++{
++	bool page_was_allocated;
++	struct page *retpage = __read_swap_cache_async(entry, gfp_mask,
++			vma, addr, &page_was_allocated);
++
++	if (page_was_allocated)
++		swap_readpage_sync(retpage, do_poll, plug);
++
++	return retpage;
++}
++
+ static unsigned int __swapin_nr_pages(unsigned long prev_offset,
+ 				      unsigned long offset,
+ 				      int hits,
+@@ -541,8 +928,9 @@ static unsigned int __swapin_nr_pages(unsigned long prev_offset,
+ 	 * random loads, swapping to hard disk or to SSD: please don't ask
+ 	 * what the "+ 2" means, it just happens to work well, that's all.
+ 	 */
++	
+ 	pages = hits + 2;
+-	if (pages == 2) {
++	if (pages == 2 && prefetch_option == 0) {
+ 		/*
+ 		 * We can have no readahead hits to judge by: but must not get
+ 		 * stuck here forever, so check for an adjacent offset instead
+@@ -585,10 +973,213 @@ static unsigned long swapin_nr_pages(unsigned long offset)
+ 	if (!hits)
+ 		WRITE_ONCE(prev_offset, offset);
+ 	atomic_set(&last_readahead_pages, pages);
++	/*switch (pages) {
++		case 1:
++		fetch_pages_1++;
++		break;
++		case 2:
++		fetch_pages_2++;
++		break;
++		case 4:
++		fetch_pages_4++;
++		break;
++		case 8:
++		fetch_pages_8++;
++		break;
++	}*/
++
++	return pages;
++}
++
++static unsigned long swapin_nr_pages_con(unsigned long offset, struct swap_history* history)
++{
++	unsigned int hits, pages, max_pages;
++
++	max_pages = 1 << READ_ONCE(page_cluster);
++	if (max_pages <= 1)
++		return 1;
++
++	history->swapin_readahead_hits_total += history->swapin_readahead_hits;
++	hits = history->swapin_readahead_hits;
++	history->swapin_readahead_hits = 0;
++	pages = __swapin_nr_pages(0, offset, hits,
++				  max_pages,
++				  history->last_readahead_pages);
++	history->last_readahead_pages = pages;
++	/*switch (pages) {
++		case 1:
++		history->fetch_1++;
++		break;
++		case 2:
++		history->fetch_2++;
++		break;
++		case 4:
++		history->fetch_4++;
++		break;
++		case 8:
++		history->fetch_8++;
++		break;
++	}*/
+ 
+ 	return pages;
+ }
+ 
++bool fm_prefetch_leap(swp_entry_t entry, gfp_t gfp_mask, unsigned long mask,
++				struct vm_area_struct *vma, unsigned long addr, struct swap_history* _swap_history)
++{
++	int stride = 0;
++
++	if(find_trend_leap(&stride, _swap_history)) {
++		struct page *page;
++		unsigned long entry_offset = swp_offset(entry);
++		struct swap_info_struct *si = swp_swap_info(entry);
++		struct swap_iocb *splug = NULL;
++		bool page_allocated;
++		int cnt = 0;
++
++		addr += stride << PAGE_SHIFT;
++		
++		for (unsigned long offset = entry_offset; cnt < mask && offset < si->max; cnt++, offset += stride, addr += stride << PAGE_SHIFT) {
++			swp_entry_t _offset = get_swp_offset(addr, _swap_history);
++			if(swp_offset(_offset) == 0 && swp_type(_offset) == 0) 
++				continue;
++
++			page = __read_swap_cache_async(
++				_offset,	gfp_mask, vma, addr, &page_allocated);
++
++			_swap_history->addr_trace[_swap_history->trace_head] = addr;
++			_swap_history->trace_head++;
++
++			if (!page)
++				continue;
++			if (page_allocated) {
++				swap_readpage(page, false, &splug);
++				if (offset != entry_offset) {
++					SetPageReadahead(page);
++					count_vm_event(SWAP_RA);
++				}
++			}
++			put_page(page);
++		}
++		lru_add_drain();
++		return true;
++	}
++
++	return false;
++}
++
++bool fm_prefetch_ghb(swp_entry_t entry, gfp_t gfp_mask, unsigned long mask,
++				struct vm_area_struct *vma, unsigned long addr, struct swap_history* _swap_history) 
++{
++	struct page *page;
++	swp_entry_t offset;
++	unsigned long entry_offset = swp_offset(entry), _addr;
++	struct swap_iocb *splug = NULL;
++	bool page_allocated, prefetched = false;
++	int curr = get_prev_idx(_swap_history->head, _swap_history);
++	int start = _swap_history->past_entry[curr].pre, cnt = 0;
++	unsigned long set[8];
++
++	if(_swap_history->sz > 3) {
++		int father = get_prev_idx(curr, _swap_history);
++		int grand_father = get_prev_idx(father, _swap_history);
++		int predecessor = get_prev_idx(grand_father, _swap_history);
++		int64_t stride = _swap_history->past_entry[curr].delta;
++		struct swap_info_struct *si = swp_swap_info(entry);
++		if(stride != _swap_history->past_entry[predecessor].delta &&
++			stride == _swap_history->past_entry[grand_father].delta &&
++			stride == _swap_history->past_entry[father].delta) {
++			for (unsigned long offset = entry_offset; cnt <= 4 && offset < si->max; cnt++, offset += stride, addr += stride << PAGE_SHIFT) {
++				swp_entry_t _offset = get_swp_offset(addr, _swap_history);
++				if(swp_offset(_offset) == 0 && swp_type(_offset) == 0) 
++					continue;
++
++				page = __read_swap_cache_async(
++					_offset,	gfp_mask, vma, addr, &page_allocated);
++
++				if (!page)
++					continue;
++				if (page_allocated) {
++					swap_readpage(page, false, &splug);
++					if (offset != entry_offset) {
++						SetPageReadahead(page);
++						count_vm_event(SWAP_RA);
++					}
++				}
++				put_page(page);
++			}
++			goto add_drain;
++		}
++	}
++	
++	for (int cursor = start; ~cursor && cnt < mask; cursor = _swap_history->past_entry[cursor].pre) {
++		_addr = addr;
++		
++		for(int depth = 1, nr_new_addr = 0; cnt < mask && nr_new_addr < 3; depth++) {
++			bool new_addr = true;
++			
++			_addr += _swap_history->past_entry[(cursor + depth) % max_window].delta << PAGE_SHIFT;
++			for(int u = 0; u < cnt && new_addr; u++)
++				if(set[u] == _addr)
++					new_addr = false;
++			
++			if(new_addr) {
++				set[cnt] = _addr;
++				cnt++;
++				nr_new_addr++;
++
++				offset = get_swp_offset(_addr, _swap_history);
++				if(swp_offset(offset) == 0 && swp_type(offset) == 0)
++					continue;
++
++				page = __read_swap_cache_async(
++					offset,
++					gfp_mask, vma, _addr, &page_allocated);
++				prefetched = true;
++
++				_swap_history->addr_trace[_swap_history->trace_head] = _addr;
++				_swap_history->trace_head++;
++				
++				if (!page)
++					continue;
++				if (page_allocated) {
++					swap_readpage(page, false, &splug);
++					if (swp_offset(offset) != entry_offset) {
++						SetPageReadahead(page);
++						count_vm_event(SWAP_RA);
++					}
++				}
++				put_page(page);
++			}
++
++			if((cursor + depth) % max_window == curr)
++				break;
++		}
++	}
++
++	/*{
++		int prevs[8], _cnt = 0, __offset = 0;
++		char *str = kzalloc(32 * sizeof(char), GFP_KERNEL);
++		if(str) {
++				for(int u = 0, cursor = start; u < 8 && ~cursor; cursor = _swap_history->past_entry[cursor].pre, u++)
++						prevs[_cnt++] = cursor;
++				for(int u = 0; u < _cnt; u++)
++						__offset += snprintf(str + __offset, 32 - __offset, "%d ", prevs[u]);
++				pr_info("addr:%lu %d's prevs %s", addr>>PAGE_SHIFT, curr, str);
++
++				kfree(str);
++		}
++		else {
++			pr_err("str creation failed");
++		}
++    }*/
++
++add_drain:
++	lru_add_drain();
++	
++	return prefetched;
++}
++
+ /**
+  * swap_cluster_readahead - swap in pages in hope we need them soon
+  * @entry: swap entry of this memory
+@@ -610,11 +1201,12 @@ static unsigned long swapin_nr_pages(unsigned long offset)
+ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 				struct vm_fault *vmf)
+ {
+-	struct page *page;
++	struct page *page, *fault_page;
+ 	unsigned long entry_offset = swp_offset(entry);
+ 	unsigned long offset = entry_offset;
+ 	unsigned long start_offset, end_offset;
+ 	unsigned long mask;
++	int cpu;
+ 	struct swap_info_struct *si = swp_swap_info(entry);
+ 	struct blk_plug plug;
+ 	struct swap_iocb *splug = NULL;
+@@ -622,10 +1214,46 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 	struct vm_area_struct *vma = vmf->vma;
+ 	unsigned long addr = vmf->address;
+ 
++	preempt_disable();
++	cpu = smp_processor_id();
++	fault_page = read_swap_cache_sync(entry, gfp_mask, vma, addr, do_poll, NULL);
++	preempt_enable();
++
+ 	mask = swapin_nr_pages(offset) - 1;
++	if(_enable_prefetch) {
++		struct swap_history *obj = lookup_in_swap_history_table(current->pid);
++		if(likely(obj)) {
++			obj->swapin_readahead_entry++;
++			mask = swapin_nr_pages_con(offset, obj);
++			rcu_read_unlock();
++		}
++	}
++	else {
++		_total_swap_pages++;
++	}
++
+ 	if (!mask)
+ 		goto skip;
+ 
++	if(_enable_prefetch) {
++		struct swap_history *_swap_history = lookup_in_swap_history_table(current->pid);
++		if(_swap_history) {
++			_swap_history->trace_head = _swap_history->trace_idx = 0;
++			switch (prefetch_option) {
++				case 1: 
++					fm_prefetch_leap(entry, gfp_mask, mask, vmf->vma, vmf->address, _swap_history);
++					break;
++				case 2:
++					fm_prefetch_ghb(entry, gfp_mask, 8, vmf->vma, vmf->address, _swap_history);
++					break;
++				default:
++					break;
++			}
++			rcu_read_unlock();
++			goto skip;
++		}
++	}
++
+ 	do_poll = false;
+ 	/* Read a page_cluster sized and aligned cluster around offset. */
+ 	start_offset = offset & ~mask;
+@@ -658,7 +1286,8 @@ struct page *swap_cluster_readahead(swp_entry_t entry, gfp_t gfp_mask,
+ 	lru_add_drain();	/* Push any new pages onto the LRU now */
+ skip:
+ 	/* The page was likely read above, so no need for plugging here */
+-	return read_swap_cache_async(entry, gfp_mask, vma, addr, do_poll, NULL);
++	frontswap_poll_load(cpu);
++	return fault_page;
+ }
+ 
+ int init_swap_address_space(unsigned int type, unsigned long nr_pages)
+@@ -907,4 +1536,4 @@ static int __init swap_init_sysfs(void)
+ 	return err;
+ }
+ subsys_initcall(swap_init_sysfs);
+-#endif
++#endif
+\ No newline at end of file
