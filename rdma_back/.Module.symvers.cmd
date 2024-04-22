@@ -1,0 +1,1 @@
+cmd_/home/sam/documents/prefetch/rdma_back/Module.symvers :=  sed 's/ko$$/o/'  /home/sam/documents/prefetch/rdma_back/modules.order | scripts/mod/modpost      -o /home/sam/documents/prefetch/rdma_back/Module.symvers -e -i Module.symvers -i /usr/src/ofa_kernel/default/Module.symvers -T - 

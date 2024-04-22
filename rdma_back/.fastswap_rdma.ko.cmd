@@ -1,0 +1,1 @@
+cmd_/home/sam/documents/prefetch/rdma_back/fastswap_rdma.ko := ld -r -m elf_x86_64 -z noexecstack --build-id=sha1  -T scripts/module.lds -o /home/sam/documents/prefetch/rdma_back/fastswap_rdma.ko /home/sam/documents/prefetch/rdma_back/fastswap_rdma.o /home/sam/documents/prefetch/rdma_back/fastswap_rdma.mod.o;  true

@@ -1,0 +1,1 @@
+cmd_/home/sam/documents/prefetch/rdma_back/fastswap_rdma.mod := printf '%s\n'   fastswap_rdma.o | awk '!x[$$0]++ { print("/home/sam/documents/prefetch/rdma_back/"$$0) }' > /home/sam/documents/prefetch/rdma_back/fastswap_rdma.mod
